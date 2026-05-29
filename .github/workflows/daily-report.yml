@@ -1,0 +1,44 @@
+name: HK Tech Preopen Report
+
+on:
+  schedule:
+    - cron: "20 23 * * *"
+    - cron: "20 0 * * *"
+  workflow_dispatch:
+
+jobs:
+  generate-and-send:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Generate and send report
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            python send_report.py --force
+          else
+            python send_report.py --schedule-guard
+          fi
+
+      - name: Upload report artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hk-tech-preopen-artifacts
+          path: |
+            reports/*.md
+            reports/*.html
+            .state/*.json
+          if-no-files-found: ignore
+
