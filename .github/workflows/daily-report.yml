@@ -2,8 +2,8 @@ name: HK Tech Preopen Report
 
 on:
   schedule:
-    - cron: "20 23 * * *"
-    - cron: "20 0 * * *"
+    - cron: "20 10 * * 1-5"
+      timezone: "Australia/Melbourne"
   workflow_dispatch:
 
 jobs:
@@ -28,7 +28,7 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             python send_report.py --force
           else
-            python send_report.py --schedule-guard
+            python send_report.py
           fi
 
       - name: Upload report artifacts
@@ -41,4 +41,3 @@ jobs:
             reports/*.html
             .state/*.json
           if-no-files-found: ignore
-
