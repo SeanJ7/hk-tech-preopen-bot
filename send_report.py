@@ -30,6 +30,7 @@ QUOTE_SYMBOLS = {
     "S&P 500": "^GSPC",
     "SMH": "SMH",
     "KWEB": "KWEB",
+    "Hang Seng Tech": "^HSTECH",
     "BABA": "BABA",
     "JD": "JD",
     "BIDU": "BIDU",
@@ -127,6 +128,17 @@ class TradingSignal:
     key_reason: str
     fx_note: str
     asia_note: str
+
+
+@dataclass
+class ProbabilityModel:
+    up_probability: Optional[float]
+    down_probability: Optional[float]
+    sample_size: int
+    composite_score: Optional[float]
+    direction: str
+    drivers: List[str]
+    note: str
 
 
 def unavailable_snapshot(label: str, symbol: str) -> QuoteSnapshot:
@@ -283,6 +295,12 @@ def fmt_pct(value: Optional[float], digits: int = 2) -> str:
         return "暂无可靠数据"
     sign = "+" if value >= 0 else ""
     return "{0}{1:.{2}f}%".format(sign, value, digits)
+
+
+def fmt_prob(value: Optional[float], digits: int = 0) -> str:
+    if value is None or math.isnan(value):
+        return "暂无可靠数据"
+    return "{0:.{1}f}%".format(value * 100.0, digits)
 
 
 def fmt_yield_tnx(snapshot: QuoteSnapshot) -> str:
@@ -512,6 +530,121 @@ def build_trading_signal(quotes: Dict[str, QuoteSnapshot]) -> TradingSignal:
     )
 
 
+def history_returns(snapshot: QuoteSnapshot) -> Dict[str, float]:
+    output: Dict[str, float] = {}
+    sorted_history = sorted(snapshot.history, key=lambda item: item[0])
+    for idx in range(1, len(sorted_history)):
+        prev_ts, prev_close = sorted_history[idx - 1]
+        ts, close = sorted_history[idx]
+        if not prev_close or math.isnan(prev_close) or math.isnan(close):
+            continue
+        date_key = datetime.fromtimestamp(ts, tz=MELBOURNE_TZ).date().isoformat()
+        output[date_key] = (close / prev_close - 1.0) * 100.0
+    return output
+
+
+def latest_before(returns: Dict[str, float], date_key: str) -> Optional[float]:
+    previous_dates = [key for key in returns if key < date_key]
+    if not previous_dates:
+        return None
+    return returns[max(previous_dates)]
+
+
+def correlation(xs: List[float], ys: List[float]) -> Optional[float]:
+    if len(xs) < 12 or len(xs) != len(ys):
+        return None
+    mean_x = sum(xs) / len(xs)
+    mean_y = sum(ys) / len(ys)
+    numerator = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+    denom_x = math.sqrt(sum((x - mean_x) ** 2 for x in xs))
+    denom_y = math.sqrt(sum((y - mean_y) ** 2 for y in ys))
+    if denom_x == 0 or denom_y == 0:
+        return None
+    return numerator / (denom_x * denom_y)
+
+
+def probability_from_score(score: float) -> float:
+    # Keep the probability useful but not overconfident for a small daily model.
+    return 1.0 / (1.0 + math.exp(-score / 2.2))
+
+
+def build_probability_model(quotes: Dict[str, QuoteSnapshot]) -> ProbabilityModel:
+    target = quotes["Hang Seng Tech"]
+    if not quote_has_price(target):
+        return ProbabilityModel(None, None, 0, None, "暂无可靠数据", [], "恒生科技指数历史数据不足，无法计算经验概率。")
+
+    target_returns = history_returns(target)
+    qqq_returns = history_returns(quotes["QQQ"])
+    kweb_returns = history_returns(quotes["KWEB"])
+    nikkei_returns = history_returns(quotes["Nikkei 225"])
+    kospi_returns = history_returns(quotes["KOSPI"])
+    asx_returns = history_returns(quotes["ASX 200"])
+
+    factor_specs = [
+        ("前夜QQQ", qqq_returns, "previous"),
+        ("前夜KWEB", kweb_returns, "previous"),
+        ("日本Nikkei", nikkei_returns, "same"),
+        ("韩国KOSPI", kospi_returns, "same"),
+        ("澳洲ASX200", asx_returns, "same"),
+    ]
+    current_values = {
+        "前夜QQQ": change_value(quotes["QQQ"]),
+        "前夜KWEB": change_value(quotes["KWEB"]),
+        "日本Nikkei": change_value(quotes["Nikkei 225"]),
+        "韩国KOSPI": change_value(quotes["KOSPI"]),
+        "澳洲ASX200": change_value(quotes["ASX 200"]),
+    }
+
+    factor_correlations: List[Tuple[str, float, float]] = []
+    sample_sizes: List[int] = []
+    for name, factor_returns, mode in factor_specs:
+        xs: List[float] = []
+        ys: List[float] = []
+        for date_key, target_ret in target_returns.items():
+            factor_ret = latest_before(factor_returns, date_key) if mode == "previous" else factor_returns.get(date_key)
+            if factor_ret is None:
+                continue
+            xs.append(factor_ret)
+            ys.append(target_ret)
+        corr = correlation(xs, ys)
+        if corr is None:
+            continue
+        factor_correlations.append((name, corr, current_values[name]))
+        sample_sizes.append(len(xs))
+
+    if len(factor_correlations) < 3 or not sample_sizes:
+        return ProbabilityModel(None, None, 0, None, "暂无可靠数据", [], "可用历史相关性样本不足，暂不输出概率。")
+
+    weighted_sum = 0.0
+    weight_total = 0.0
+    drivers: List[str] = []
+    for name, corr, current_ret in factor_correlations:
+        weight = abs(corr)
+        if weight <= 0.03:
+            continue
+        weighted_sum += weight * corr * current_ret
+        weight_total += weight
+        drivers.append("{0}相关性 {1:+.2f}，当前 {2}".format(name, corr, fmt_pct(current_ret)))
+
+    if weight_total == 0:
+        return ProbabilityModel(None, None, min(sample_sizes), None, "暂无可靠数据", drivers, "历史相关性过低，暂不输出概率。")
+
+    composite_score = weighted_sum / weight_total
+    up_probability = probability_from_score(composite_score)
+    down_probability = 1.0 - up_probability
+    direction = "上涨概率占优" if up_probability >= 0.56 else "下跌概率占优" if up_probability <= 0.44 else "概率接近均衡"
+    note = "基于近3个月日收益相关性；美股因子使用前一交易日，亚洲因子使用同日开盘后可得行情代理。"
+    return ProbabilityModel(
+        up_probability=up_probability,
+        down_probability=down_probability,
+        sample_size=min(sample_sizes),
+        composite_score=composite_score,
+        direction=direction,
+        drivers=drivers[:5],
+        note=note,
+    )
+
+
 def telegram_chunks(messages: List[str]) -> List[str]:
     output = []
     for message in messages:
@@ -631,6 +764,7 @@ def build_report(quotes: Dict[str, QuoteSnapshot]) -> Tuple[str, List[str]]:
     asx = quotes["ASX 200"]
 
     signal = build_trading_signal(quotes)
+    probability = build_probability_model(quotes)
     score_us = signal.score_us
     score_cn = signal.score_cn
     score_asia = signal.score_asia
@@ -678,6 +812,10 @@ def build_report(quotes: Dict[str, QuoteSnapshot]) -> Tuple[str, List[str]]:
             "仓位：{0}".format(position),
             "状态：{0}".format(state),
             "动作：{0}".format(signal.action_preopen),
+            "概率：涨 {0} / 跌 {1}".format(
+                fmt_prob(probability.up_probability),
+                fmt_prob(probability.down_probability),
+            ),
             "",
             "一句话：",
             one_liner,
@@ -693,6 +831,7 @@ def build_report(quotes: Dict[str, QuoteSnapshot]) -> Tuple[str, List[str]]:
             "8. 日本/韩国/澳洲：{0} / {1} / {2}。".format(fmt_pct(nikkei.change_pct), fmt_pct(kospi.change_pct), fmt_pct(asx.change_pct)),
             "9. 恒科判断：{0}，动作 {1}。".format(direction, signal.action_preopen),
             "10. 风险备注：{0}；{1}。".format(signal.fx_note, signal.asia_note),
+            "11. 历史概率：{0}，样本 {1}日。".format(probability.direction, probability.sample_size if probability.sample_size else "不足"),
             "",
             "## 7. 🕒三阶段交易计划",
             "A. 开盘前3–4小时",
@@ -756,6 +895,11 @@ def build_report(quotes: Dict[str, QuoteSnapshot]) -> Tuple[str, List[str]]:
             "恒科权重一致性：{0}/5".format(score_hk),
             "综合方向分：{0}/25".format(total_score),
             "今日信号等级：{0}".format(score_bucket(total_score)),
+            "历史概率：涨 {0} / 跌 {1}".format(
+                fmt_prob(probability.up_probability),
+                fmt_prob(probability.down_probability),
+            ),
+            "概率方向：{0}".format(probability.direction),
             "",
             "## 5. 🌏外围传导判断",
             "美股 → 恒科：{0}｜原因：QQQ {1}。".format("正向" if score_us >= 4 else "中性/负向", fmt_pct(qqq.change_pct)),
@@ -893,6 +1037,7 @@ def build_detailed_report(quotes: Dict[str, QuoteSnapshot], report_date: str, me
     asx = quotes["ASX 200"]
 
     signal = build_trading_signal(quotes)
+    probability = build_probability_model(quotes)
     score_us = signal.score_us
     score_cn = signal.score_cn
     score_asia = signal.score_asia
@@ -912,6 +1057,11 @@ def build_detailed_report(quotes: Dict[str, QuoteSnapshot], report_date: str, me
         "## 1分钟结论",
         "- 方向：{0}｜信心：{1}｜仓位：{2}｜状态：{3}".format(direction, confidence, position, state),
         "- 盘前动作：{0}｜多头 {1}/10｜空头 {2}/10".format(signal.action_preopen, signal.long_trigger, signal.short_trigger),
+        "- 历史概率：涨 {0}｜跌 {1}｜{2}".format(
+            fmt_prob(probability.up_probability),
+            fmt_prob(probability.down_probability),
+            probability.direction,
+        ),
         "- 美股科技：Nasdaq {0}｜QQQ {1}｜SMH {2}".format(
             fmt_pct(nasdaq.change_pct), fmt_pct(qqq.change_pct), fmt_pct(smh.change_pct)
         ),
@@ -959,6 +1109,16 @@ def build_detailed_report(quotes: Dict[str, QuoteSnapshot], report_date: str, me
         "- 综合方向分：{0}/25".format(total_score),
         "- 今日信号等级：{0}".format(score_bucket(total_score)),
         "- 多头触发：{0}/10｜空头触发：{1}/10｜风险：{2}".format(signal.long_trigger, signal.short_trigger, signal.risk_level),
+        "",
+        "### 3.1 历史相关性概率模型",
+        "- 预测上涨概率：{0}".format(fmt_prob(probability.up_probability)),
+        "- 预测下跌概率：{0}".format(fmt_prob(probability.down_probability)),
+        "- 概率方向：{0}".format(probability.direction),
+        "- 样本数量：{0} 日".format(probability.sample_size if probability.sample_size else "暂无可靠数据"),
+        "- 综合分数：{0}".format(fmt_num(probability.composite_score, 3) if probability.composite_score is not None else "暂无可靠数据"),
+        "- 模型说明：{0}".format(probability.note),
+        "- 主要相关性驱动：",
+        *["  - {0}".format(driver) for driver in probability.drivers],
         "",
         "### 4. 外围传导判断",
         "- 美股 → 恒科：{0}｜原因：QQQ {1}".format("正向" if score_us >= 4 else "中性/负向", fmt_pct(qqq.change_pct)),
