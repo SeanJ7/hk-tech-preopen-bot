@@ -107,6 +107,28 @@ class QuoteSnapshot:
         return (self.close / earlier - 1.0) * 100.0
 
 
+@dataclass
+class TradingSignal:
+    direction: str
+    confidence: str
+    position: str
+    state: str
+    action_preopen: str
+    score_us: int
+    score_cn: int
+    score_asia: int
+    score_fx: int
+    score_hk: int
+    total_score: int
+    long_trigger: int
+    short_trigger: int
+    risk_level: str
+    one_liner: str
+    key_reason: str
+    fx_note: str
+    asia_note: str
+
+
 def unavailable_snapshot(label: str, symbol: str) -> QuoteSnapshot:
     return QuoteSnapshot(
         symbol=symbol,
@@ -344,6 +366,152 @@ def direction_label(total_score: int) -> Tuple[str, str, str]:
     return "偏空", "中高", "温和偏空"
 
 
+def change_value(snapshot: QuoteSnapshot, fallback: float = 0.0) -> float:
+    return snapshot.change_pct if snapshot.change_pct is not None else fallback
+
+
+def positive_count(quotes: Dict[str, QuoteSnapshot], keys: List[str]) -> int:
+    return sum(1 for key in keys if change_value(quotes[key], -99.0) > 0)
+
+
+def negative_count(quotes: Dict[str, QuoteSnapshot], keys: List[str]) -> int:
+    return sum(1 for key in keys if change_value(quotes[key], 99.0) < 0)
+
+
+def build_trading_signal(quotes: Dict[str, QuoteSnapshot]) -> TradingSignal:
+    nasdaq = quotes["Nasdaq"]
+    qqq = quotes["QQQ"]
+    smh = quotes["SMH"]
+    kweb = quotes["KWEB"]
+    us10y = quotes["US10Y"]
+    dxy = quotes["DXY"]
+    usdcnh = quotes["USD/CNH"]
+    nikkei = quotes["Nikkei 225"]
+    kospi = quotes["KOSPI"]
+    kosdaq = quotes["KOSDAQ"]
+    asx = quotes["ASX 200"]
+
+    adr_core = ["TCEHY", "BABA", "JD", "BIDU", "NTES", "TCOM", "BILI"]
+    adr_high_beta = ["XPEV", "LI", "NIO"]
+    adr_positive = positive_count(quotes, adr_core)
+    adr_negative = negative_count(quotes, adr_core)
+    asia_positive = positive_count(quotes, ["Nikkei 225", "KOSPI", "ASX 200"])
+    asia_negative = negative_count(quotes, ["Nikkei 225", "KOSPI", "ASX 200"])
+
+    qqq_chg = change_value(qqq)
+    nasdaq_chg = change_value(nasdaq)
+    smh_chg = change_value(smh)
+    kweb_chg = change_value(kweb)
+    usdcnh_chg = change_value(usdcnh, 0.0)
+    dxy_chg = change_value(dxy, 0.0)
+    us10y_chg = change_value(us10y, 0.0)
+    kosdaq_chg = change_value(kosdaq)
+    kospi_chg = change_value(kospi)
+
+    score_us = 5 if qqq_chg > 0.8 and nasdaq_chg > 0.8 else 4 if qqq_chg > 0 and nasdaq_chg > 0 else 2 if qqq_chg > -0.5 else 1
+    score_cn = 5 if kweb_chg > qqq_chg and kweb_chg > 0 and adr_positive >= 4 else 4 if kweb_chg > 0 and adr_positive >= 3 else 2 if kweb_chg > -0.5 else 1
+    score_asia = 5 if asia_positive == 3 and kosdaq_chg >= kospi_chg else 4 if asia_positive >= 2 else 2 if asia_negative < 2 else 1
+    score_fx = 5 if usdcnh_chg < -0.1 and dxy_chg <= 0 else 4 if usdcnh_chg <= 0.15 and dxy_chg <= 0.4 else 2 if usdcnh_chg <= 0.35 else 1
+    score_hk = 5 if adr_positive >= 5 and adr_negative <= 1 else 4 if adr_positive >= 4 else 2 if adr_negative <= 4 else 1
+    total_score = score_us + score_cn + score_asia + score_fx + score_hk
+
+    long_trigger = sum(
+        [
+            1 if qqq_chg > 0 else 0,
+            1 if nasdaq_chg > 0 else 0,
+            1 if kweb_chg > 0 else 0,
+            1 if kweb_chg >= qqq_chg - 0.2 else 0,
+            1 if adr_positive >= 4 else 0,
+            1 if asia_positive >= 2 else 0,
+            1 if kosdaq_chg >= kospi_chg else 0,
+            1 if smh_chg > 0 else 0,
+            1 if usdcnh_chg <= 0.15 else 0,
+            1 if us10y_chg <= 0 else 0,
+        ]
+    )
+    short_trigger = sum(
+        [
+            1 if qqq_chg < 0 else 0,
+            1 if nasdaq_chg < 0 else 0,
+            1 if kweb_chg < 0 else 0,
+            1 if kweb_chg < qqq_chg - 0.5 else 0,
+            1 if adr_negative >= 4 else 0,
+            1 if asia_negative >= 2 else 0,
+            1 if kosdaq_chg < kospi_chg else 0,
+            1 if smh_chg < 0 else 0,
+            1 if usdcnh_chg > 0.25 else 0,
+            1 if us10y_chg > 0 else 0,
+        ]
+    )
+
+    edge = long_trigger - short_trigger
+    if long_trigger >= 7 and edge >= 4:
+        direction, state, action_preopen = "偏多", "强多盘前", "做多"
+    elif long_trigger >= 6 and edge >= 2:
+        direction, state, action_preopen = "偏多", "温和偏多", "轻仓做多"
+    elif short_trigger >= 7 and edge <= -4:
+        direction, state, action_preopen = "偏空", "强空盘前", "做空"
+    elif short_trigger >= 6 and edge <= -2:
+        direction, state, action_preopen = "偏空", "温和偏空", "轻仓做空"
+    elif long_trigger >= 5 and short_trigger >= 5:
+        direction, state, action_preopen = "震荡", "高开低走风险", "只等确认"
+    else:
+        direction, state, action_preopen = "震荡", "震荡等待确认", "观望"
+
+    if abs(edge) >= 5 and total_score >= 20:
+        confidence = "高"
+    elif abs(edge) >= 3 and total_score >= 16:
+        confidence = "中高"
+    elif abs(edge) >= 2:
+        confidence = "中"
+    elif abs(edge) >= 1:
+        confidence = "中低"
+    else:
+        confidence = "低"
+
+    if action_preopen in ("做多", "做空"):
+        position = "中"
+    elif action_preopen in ("轻仓做多", "轻仓做空"):
+        position = "中低"
+    elif action_preopen == "只等确认":
+        position = "低"
+    else:
+        position = "空仓"
+
+    risk_level = "高" if short_trigger >= 7 or (long_trigger >= 5 and short_trigger >= 5) else "中高" if short_trigger >= 5 else "中" if short_trigger >= 3 else "低"
+    fx_note = "人民币稳定/偏强" if usdcnh_chg <= 0.15 else "人民币偏弱，压制港股" if usdcnh_chg > 0.25 else "人民币中性"
+    asia_note = "亚洲开盘确认偏强" if asia_positive >= 2 else "亚洲开盘偏弱" if asia_negative >= 2 else "亚洲开盘分化"
+    key_reason = "美股科技、中概ADR、亚洲开盘与汇率共同决定方向；冲突越多，越需要等港股开盘确认。"
+    one_liner = "美股科技{0}，中概{1}，亚洲{2}，人民币{3}，恒科盘前更偏向{4}。".format(
+        "偏强" if score_us >= 4 else "偏弱" if score_us <= 2 else "中性",
+        "支持" if score_cn >= 4 else "拖累" if score_cn <= 2 else "中性",
+        "偏强" if score_asia >= 4 else "偏弱" if score_asia <= 2 else "分化",
+        "稳定" if score_fx >= 4 else "承压",
+        direction,
+    )
+
+    return TradingSignal(
+        direction=direction,
+        confidence=confidence,
+        position=position,
+        state=state,
+        action_preopen=action_preopen,
+        score_us=score_us,
+        score_cn=score_cn,
+        score_asia=score_asia,
+        score_fx=score_fx,
+        score_hk=score_hk,
+        total_score=total_score,
+        long_trigger=long_trigger,
+        short_trigger=short_trigger,
+        risk_level=risk_level,
+        one_liner=one_liner,
+        key_reason=key_reason,
+        fx_note=fx_note,
+        asia_note=asia_note,
+    )
+
+
 def telegram_chunks(messages: List[str]) -> List[str]:
     output = []
     for message in messages:
@@ -462,22 +630,19 @@ def build_report(quotes: Dict[str, QuoteSnapshot]) -> Tuple[str, List[str]]:
     kosdaq = quotes["KOSDAQ"]
     asx = quotes["ASX 200"]
 
-    score_us = 4 if (nasdaq.change_pct or 0) > 0 and (qqq.change_pct or 0) > 0 else 2
-    score_cn = 4 if (kweb.change_pct or 0) > 0 and sum((quotes[k].change_pct or -99) > 0 for k in ["BABA", "JD", "BIDU", "TCEHY"]) >= 2 else 2
-    score_asia = 4 if (nikkei.change_pct or 0) > 0 and (kospi.change_pct or 0) > 0 and (asx.change_pct or 0) > 0 else 2
-    score_fx = 4 if (usdcnh.change_pct or 99) <= 0.2 and (dxy.change_pct or 99) <= 0.5 else 2
+    signal = build_trading_signal(quotes)
+    score_us = signal.score_us
+    score_cn = signal.score_cn
+    score_asia = signal.score_asia
+    score_fx = signal.score_fx
     hk_positive = sum((quotes[k].change_pct or -99) > 0 for k in ["TCEHY", "BABA", "JD", "NTES", "BIDU", "TCOM", "BILI", "XPEV", "LI", "NIO"])
-    score_hk = 4 if hk_positive >= 5 else 2
-    total_score = score_us + score_cn + score_asia + score_fx + score_hk
-    direction, confidence, state = direction_label(total_score)
-
-    position = "中高" if total_score >= 20 else "中" if total_score >= 15 else "中低" if total_score >= 10 else "低"
-    one_liner = "美股{0}，亚洲{1}，人民币{2}，恒科今日更偏向{3}。".format(
-        "偏强" if (nasdaq.change_pct or 0) > 0 else "偏弱",
-        "确认偏强" if (nikkei.change_pct or 0) > 0 and (kospi.change_pct or 0) > 0 else "分化",
-        "稳定" if (usdcnh.change_pct or 99) <= 0.2 else "承压",
-        direction,
-    )
+    score_hk = signal.score_hk
+    total_score = signal.total_score
+    direction = signal.direction
+    confidence = signal.confidence
+    state = signal.state
+    position = signal.position
+    one_liner = signal.one_liner
 
     hk_positive_lines = []
     hk_negative_lines = []
@@ -512,6 +677,7 @@ def build_report(quotes: Dict[str, QuoteSnapshot]) -> Tuple[str, List[str]]:
             "信心：{0}".format(confidence),
             "仓位：{0}".format(position),
             "状态：{0}".format(state),
+            "动作：{0}".format(signal.action_preopen),
             "",
             "一句话：",
             one_liner,
@@ -525,17 +691,18 @@ def build_report(quotes: Dict[str, QuoteSnapshot]) -> Tuple[str, List[str]]:
             "6. DXY：{0}，美元{1}。".format(fmt_pct(dxy.change_pct), "偏稳" if (dxy.change_pct or 99) <= 0.5 else "偏强"),
             "7. USD/CNH：{0}，人民币{1}。".format(fmt_num(usdcnh.close, 4), "稳定" if (usdcnh.change_pct or 99) <= 0.2 else "偏弱"),
             "8. 日本/韩国/澳洲：{0} / {1} / {2}。".format(fmt_pct(nikkei.change_pct), fmt_pct(kospi.change_pct), fmt_pct(asx.change_pct)),
-            "9. 恒科判断：{0}，但需看港股开盘确认。".format(direction),
+            "9. 恒科判断：{0}，动作 {1}。".format(direction, signal.action_preopen),
+            "10. 风险备注：{0}；{1}。".format(signal.fx_note, signal.asia_note),
             "",
             "## 7. 🕒三阶段交易计划",
             "A. 开盘前3–4小时",
-            "动作：{0}".format("做多" if total_score >= 20 else "观望" if total_score < 15 else "只等确认"),
+            "动作：{0}".format(signal.action_preopen),
             "仓位：{0}".format(position),
-            "理由：外围信号{0}。".format("偏正面" if total_score >= 15 else "不够一致"),
-            "取消条件：USD/CNH快速上冲 / 亚洲转弱。",
+            "理由：{0}".format(signal.key_reason),
+            "取消条件：KWEB反向 / USD-CNH上冲 / 日韩转弱。",
             "",
             "B. 开盘前30分钟",
-            "动作：{0}".format("持有并观察" if total_score >= 20 else "不追 / 等开盘"),
+            "动作：{0}".format("持有并观察" if signal.action_preopen in ("做多", "做空", "轻仓做多", "轻仓做空") else "不追 / 等开盘"),
             "重点看：恒科代理、USD/CNH、腾讯/阿里、日韩是否回落。",
             "",
             "C. 开盘后15–120分钟",
@@ -600,6 +767,7 @@ def build_report(quotes: Dict[str, QuoteSnapshot]) -> Tuple[str, List[str]]:
                 fmt_pct(asx.change_pct),
             ),
             "汇率 → 恒科：{0}｜原因：USD/CNH {1}。".format("正向" if score_fx >= 4 else "负向", fmt_num(usdcnh.close, 4)),
+            "最终传导：{0}｜{1}。".format(signal.direction, signal.key_reason),
             "",
             "## 6. 🧩恒科核心权重检查",
             "权重一致性：{0}".format("强" if score_hk >= 4 else "中" if score_hk >= 2 else "弱"),
@@ -617,29 +785,8 @@ def build_report(quotes: Dict[str, QuoteSnapshot]) -> Tuple[str, List[str]]:
     )
     message2 = "\n".join(message2_lines)
 
-    long_trigger = sum(
-        [
-            1 if (qqq.change_pct or 0) > 0 else 0,
-            1 if (kweb.change_pct or 0) > 0 else 0,
-            1 if (nikkei.change_pct or 0) > 0 else 0,
-            1 if (kospi.change_pct or 0) > 0 else 0,
-            1 if (asx.change_pct or 0) > 0 else 0,
-            1 if (usdcnh.change_pct or 99) <= 0.2 else 0,
-            1 if score_hk >= 4 else 0,
-        ]
-    )
-    short_trigger = sum(
-        [
-            1 if (qqq.change_pct or 0) < 0 else 0,
-            1 if (kweb.change_pct or 0) < 0 else 0,
-            1 if (nikkei.change_pct or 0) < 0 else 0,
-            1 if (kospi.change_pct or 0) < 0 else 0,
-            1 if (kosdaq.change_pct or 0) < (kospi.change_pct or 0) else 0,
-            1 if (asx.change_pct or 0) < 0 else 0,
-            1 if (usdcnh.change_pct or 0) > 0.2 else 0,
-            1 if (us10y.change_pct or 0) > 0 else 0,
-        ]
-    )
+    long_trigger = signal.long_trigger
+    short_trigger = signal.short_trigger
     hkf_support, hkf_resistance = support_resistance(kweb)
     qqq_support, qqq_resistance = support_resistance(qqq)
 
@@ -651,7 +798,7 @@ def build_report(quotes: Dict[str, QuoteSnapshot]) -> Tuple[str, List[str]]:
             "",
             "## 9. ❌做空 / 避险条件",
             "今日已触发：{0}/10".format(short_trigger),
-            "风险等级：{0}".format("高" if short_trigger >= 7 else "中高" if short_trigger >= 5 else "中" if short_trigger >= 3 else "低"),
+            "风险等级：{0}".format(signal.risk_level),
             "",
             "## 10. 🎯关键价位与触发器",
             "恒科代理（KWEB）：",
@@ -703,10 +850,10 @@ def build_report(quotes: Dict[str, QuoteSnapshot]) -> Tuple[str, List[str]]:
             "",
             "## 14. 🧾最终交易结论",
             "今日方向：{0}".format(direction),
-            "是否适合盘前建仓：{0}".format("是" if total_score >= 20 else "只适合轻仓" if total_score >= 15 else "等确认"),
+            "是否适合盘前建仓：{0}".format("是" if signal.action_preopen in ("做多", "做空") else "只适合轻仓" if signal.action_preopen in ("轻仓做多", "轻仓做空") else "等确认"),
             "建议仓位：{0}".format(position),
             "我的计划：",
-            "- 盘前：{0}".format("轻仓试单偏多" if total_score >= 20 else "先观察外围一致性"),
+            "- 盘前：{0}".format(signal.action_preopen),
             "- 开盘前30分钟：盯USD/CNH和核心ADR",
             "- 开盘后15分钟：只做站稳开盘价方向",
             "- 开盘后1–2小时：优先止盈 / 止损 / 平仓",
@@ -745,15 +892,17 @@ def build_detailed_report(quotes: Dict[str, QuoteSnapshot], report_date: str, me
     kosdaq = quotes["KOSDAQ"]
     asx = quotes["ASX 200"]
 
-    score_us = 4 if (nasdaq.change_pct or 0) > 0 and (qqq.change_pct or 0) > 0 else 2
-    score_cn = 4 if (kweb.change_pct or 0) > 0 and sum((quotes[k].change_pct or -99) > 0 for k in ["BABA", "JD", "BIDU", "TCEHY"]) >= 2 else 2
-    score_asia = 4 if (nikkei.change_pct or 0) > 0 and (kospi.change_pct or 0) > 0 and (asx.change_pct or 0) > 0 else 2
-    score_fx = 4 if (usdcnh.change_pct or 99) <= 0.2 and (dxy.change_pct or 99) <= 0.5 else 2
-    hk_positive = sum((quotes[k].change_pct or -99) > 0 for k in ["TCEHY", "BABA", "JD", "NTES", "BIDU", "TCOM", "BILI", "XPEV", "LI", "NIO"])
-    score_hk = 4 if hk_positive >= 5 else 2
-    total_score = score_us + score_cn + score_asia + score_fx + score_hk
-    direction, confidence, state = direction_label(total_score)
-    position = "中高" if total_score >= 20 else "中" if total_score >= 15 else "中低" if total_score >= 10 else "低"
+    signal = build_trading_signal(quotes)
+    score_us = signal.score_us
+    score_cn = signal.score_cn
+    score_asia = signal.score_asia
+    score_fx = signal.score_fx
+    score_hk = signal.score_hk
+    total_score = signal.total_score
+    direction = signal.direction
+    confidence = signal.confidence
+    state = signal.state
+    position = signal.position
     kweb_support, kweb_resistance = support_resistance(kweb)
     qqq_support, qqq_resistance = support_resistance(qqq)
 
@@ -762,6 +911,7 @@ def build_detailed_report(quotes: Dict[str, QuoteSnapshot], report_date: str, me
         "",
         "## 1分钟结论",
         "- 方向：{0}｜信心：{1}｜仓位：{2}｜状态：{3}".format(direction, confidence, position, state),
+        "- 盘前动作：{0}｜多头 {1}/10｜空头 {2}/10".format(signal.action_preopen, signal.long_trigger, signal.short_trigger),
         "- 美股科技：Nasdaq {0}｜QQQ {1}｜SMH {2}".format(
             fmt_pct(nasdaq.change_pct), fmt_pct(qqq.change_pct), fmt_pct(smh.change_pct)
         ),
@@ -774,7 +924,7 @@ def build_detailed_report(quotes: Dict[str, QuoteSnapshot], report_date: str, me
         "- 汇率与利率：10Y {0}｜DXY {1}｜USD/CNH {2}".format(
             fmt_yield_tnx(us10y), fmt_pct(dxy.change_pct), fmt_num(usdcnh.close, 4)
         ),
-        "- 盘前结论：如果亚洲不转弱、人民币不走贬，恒科更偏向 {0}。".format(direction),
+        "- 盘前结论：{0}".format(signal.one_liner),
         "",
         "## 详细版",
         "",
@@ -783,6 +933,7 @@ def build_detailed_report(quotes: Dict[str, QuoteSnapshot], report_date: str, me
         "- 信心：{0}".format(confidence),
         "- 建议仓位：{0}".format(position),
         "- 状态标签：{0}".format(state),
+        "- 盘前动作：{0}".format(signal.action_preopen),
         "",
         "### 2. 核心数据快照",
         "- Nasdaq：{0}｜QQQ：{1}｜S&P 500：{2}｜SMH：{3}".format(
@@ -807,6 +958,7 @@ def build_detailed_report(quotes: Dict[str, QuoteSnapshot], report_date: str, me
         "- 恒科权重一致性：{0}/5".format(score_hk),
         "- 综合方向分：{0}/25".format(total_score),
         "- 今日信号等级：{0}".format(score_bucket(total_score)),
+        "- 多头触发：{0}/10｜空头触发：{1}/10｜风险：{2}".format(signal.long_trigger, signal.short_trigger, signal.risk_level),
         "",
         "### 4. 外围传导判断",
         "- 美股 → 恒科：{0}｜原因：QQQ {1}".format("正向" if score_us >= 4 else "中性/负向", fmt_pct(qqq.change_pct)),
@@ -816,6 +968,7 @@ def build_detailed_report(quotes: Dict[str, QuoteSnapshot], report_date: str, me
             fmt_pct(nikkei.change_pct), fmt_pct(kospi.change_pct), fmt_pct(asx.change_pct)
         ),
         "- 汇率 → 恒科：{0}｜原因：USD/CNH {1}".format("正向" if score_fx >= 4 else "负向", fmt_num(usdcnh.close, 4)),
+        "- 综合 → 恒科：{0}｜{1}".format(signal.direction, signal.key_reason),
         "",
         "### 5. 恒科核心权重检查",
         "- 腾讯 / TCEHY：{0}".format(fmt_pct(quotes["TCEHY"].change_pct)),
@@ -831,7 +984,7 @@ def build_detailed_report(quotes: Dict[str, QuoteSnapshot], report_date: str, me
         "- 无可靠盘前代理：美团、小米、快手。",
         "",
         "### 6. 三阶段交易计划",
-        "- 开盘前 3-4 小时：{0}，仓位 {1}。".format("可轻仓试单" if total_score >= 20 else "以观察为主", position),
+        "- 开盘前 3-4 小时：{0}，仓位 {1}。".format(signal.action_preopen, position),
         "- 开盘前 30 分钟：重点看 USD/CNH、QQQ、KWEB、腾讯/阿里/京东代理、日韩是否转弱。",
         "- 开盘后 15-120 分钟：先看是否站稳开盘价，再看成交是否确认；1-2 小时内优先止盈止损。",
         "",
@@ -853,7 +1006,7 @@ def build_detailed_report(quotes: Dict[str, QuoteSnapshot], report_date: str, me
         "",
         "### 10. 最终交易结论",
         "- 今日方向：{0}".format(direction),
-        "- 是否适合盘前建仓：{0}".format("是" if total_score >= 20 else "只适合轻仓" if total_score >= 15 else "等确认"),
+        "- 是否适合盘前建仓：{0}".format("是" if signal.action_preopen in ("做多", "做空") else "只适合轻仓" if signal.action_preopen in ("轻仓做多", "轻仓做空") else "等确认"),
         "- 建议仓位：{0}".format(position),
         "- 最重要的 5 个确认信号：QQQ、KWEB、USD/CNH、Nikkei/KOSPI、腾讯/阿里/京东代理。",
         "- 最重要的 3 个取消 / 止损条件：KWEB 转弱、USD/CNH 快速上行、开盘后跌破开盘价无法收复。",
