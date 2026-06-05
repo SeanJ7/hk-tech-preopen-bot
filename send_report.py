@@ -31,6 +31,9 @@ QUOTE_SYMBOLS = {
     "SMH": "SMH",
     "KWEB": "KWEB",
     "Hang Seng Tech": "^HSTECH",
+    "Hang Seng Tech ETF 3067": "3067.HK",
+    "Hang Seng Tech ETF 3032": "3032.HK",
+    "Hang Seng Tech ETF KTEC": "KTEC.L",
     "BABA": "BABA",
     "JD": "JD",
     "BIDU": "BIDU",
@@ -551,7 +554,7 @@ def latest_before(returns: Dict[str, float], date_key: str) -> Optional[float]:
 
 
 def correlation(xs: List[float], ys: List[float]) -> Optional[float]:
-    if len(xs) < 12 or len(xs) != len(ys):
+    if len(xs) < 8 or len(xs) != len(ys):
         return None
     mean_x = sum(xs) / len(xs)
     mean_y = sum(ys) / len(ys)
@@ -569,11 +572,23 @@ def probability_from_score(score: float) -> float:
 
 
 def build_probability_model(quotes: Dict[str, QuoteSnapshot]) -> ProbabilityModel:
-    target = quotes["Hang Seng Tech"]
-    if not quote_has_price(target):
-        return ProbabilityModel(None, None, 0, None, "暂无可靠数据", [], "恒生科技指数历史数据不足，无法计算经验概率。")
+    target_candidates = [
+        ("恒生科技指数 ^HSTECH", quotes["Hang Seng Tech"]),
+        ("南方恒生科技 3067.HK", quotes["Hang Seng Tech ETF 3067"]),
+        ("恒生科技ETF 3032.HK", quotes["Hang Seng Tech ETF 3032"]),
+        ("KTEC.L 恒生科技ETF", quotes["Hang Seng Tech ETF KTEC"]),
+    ]
+    target_name = "暂无可靠数据"
+    target_returns: Dict[str, float] = {}
+    for candidate_name, candidate_snapshot in target_candidates:
+        candidate_returns = history_returns(candidate_snapshot)
+        if quote_has_price(candidate_snapshot) and len(candidate_returns) >= 20:
+            target_name = candidate_name
+            target_returns = candidate_returns
+            break
+    if not target_returns:
+        return ProbabilityModel(None, None, 0, None, "暂无可靠数据", [], "恒生科技指数/ETF代理历史数据不足，无法计算经验概率。")
 
-    target_returns = history_returns(target)
     qqq_returns = history_returns(quotes["QQQ"])
     kweb_returns = history_returns(quotes["KWEB"])
     nikkei_returns = history_returns(quotes["Nikkei 225"])
@@ -602,6 +617,8 @@ def build_probability_model(quotes: Dict[str, QuoteSnapshot]) -> ProbabilityMode
         ys: List[float] = []
         for date_key, target_ret in target_returns.items():
             factor_ret = latest_before(factor_returns, date_key) if mode == "previous" else factor_returns.get(date_key)
+            if factor_ret is None and mode == "same":
+                factor_ret = latest_before(factor_returns, date_key)
             if factor_ret is None:
                 continue
             xs.append(factor_ret)
@@ -633,7 +650,7 @@ def build_probability_model(quotes: Dict[str, QuoteSnapshot]) -> ProbabilityMode
     up_probability = probability_from_score(composite_score)
     down_probability = 1.0 - up_probability
     direction = "上涨概率占优" if up_probability >= 0.56 else "下跌概率占优" if up_probability <= 0.44 else "概率接近均衡"
-    note = "基于近3个月日收益相关性；美股因子使用前一交易日，亚洲因子使用同日开盘后可得行情代理。"
+    note = "目标代理：{0}。基于近3个月日收益相关性；美股因子使用前一交易日，亚洲因子使用同日开盘后可得行情代理。".format(target_name)
     return ProbabilityModel(
         up_probability=up_probability,
         down_probability=down_probability,
