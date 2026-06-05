@@ -186,9 +186,15 @@ def should_run_for_schedule() -> bool:
 
 
 def fetch_json(url: str) -> Dict:
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
-        return json.loads(response.read().decode("utf-8"))
+    last_error: Optional[Exception] = None
+    for _ in range(3):
+        request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        try:
+            with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except Exception as exc:
+            last_error = exc
+    raise last_error if last_error is not None else RuntimeError("Unknown fetch_json error")
 
 
 def fetch_chart(symbol: str, label: str) -> QuoteSnapshot:
@@ -274,32 +280,47 @@ def quote_ok(snapshot: QuoteSnapshot) -> bool:
     return snapshot.change_pct is not None
 
 
+def quote_has_price(snapshot: QuoteSnapshot) -> bool:
+    return snapshot.close is not None and not math.isnan(snapshot.close)
+
+
 def data_completeness(quotes: Dict[str, QuoteSnapshot]) -> Tuple[bool, List[str], List[str]]:
     reasons = []
     confirmed = []
+    hard_missing = []
 
-    required = ["Nasdaq", "QQQ", "S&P 500", "US10Y", "DXY", "USD/CNH", "KWEB", "Nikkei 225", "KOSPI", "ASX 200"]
-    for key in required:
-        if quote_ok(quotes[key]):
+    hard_required = ["Nasdaq", "QQQ", "S&P 500", "US10Y", "DXY", "KWEB", "Nikkei 225", "KOSPI", "ASX 200"]
+    for key in hard_required:
+        if quote_has_price(quotes[key]):
             confirmed.append(key)
         else:
-            reasons.append("{0} 暂无可靠数据".format(key))
+            hard_missing.append("{0} 暂无可靠数据".format(key))
 
-    if not quote_ok(quotes["TOPIX"]):
+    if quote_has_price(quotes["USD/CNH"]):
+        confirmed.append("USD/CNH")
+    else:
+        reasons.append("USD/CNH 暂无可靠数据，汇率判断降级")
+
+    if quote_has_price(quotes["TOPIX"]):
+        confirmed.append("TOPIX")
+    else:
         reasons.append("TOPIX 暂无可靠数据")
-    if not quote_ok(quotes["KOSDAQ"]):
+
+    if quote_has_price(quotes["KOSDAQ"]):
+        confirmed.append("KOSDAQ")
+    else:
         reasons.append("KOSDAQ 暂无可靠数据")
 
     adr_keys = ["BABA", "JD", "BIDU", "PDD", "BILI", "TCEHY", "NTES", "TCOM"]
-    adr_available = sum(1 for key in adr_keys if quote_ok(quotes[key]))
+    adr_available = sum(1 for key in adr_keys if quote_has_price(quotes[key]))
     if adr_available >= 4:
         confirmed.append("中概 / ADR")
     else:
-        reasons.append("中概 / ADR 数据不完整")
+        hard_missing.append("中概 / ADR 数据不完整")
 
     reasons.append("恒指夜期 / 恒科夜期 暂无统一免费可靠源，采用 ADR / ETF 代理")
-
-    enough = len([r for r in reasons if "暂无统一免费可靠源" not in r]) == 0
+    reasons = hard_missing + reasons
+    enough = len(hard_missing) == 0
     return enough, confirmed, reasons
 
 
